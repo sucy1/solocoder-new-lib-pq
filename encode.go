@@ -345,6 +345,12 @@ func FormatTimestamp(t time.Time) []byte {
 // Parse a bytea value received from the server.  Both "hex" and the legacy
 // "escape" format are supported.
 func parseBytea(s []byte) (result []byte, err error) {
+	if s == nil {
+		return nil, nil
+	}
+	if len(s) == 0 {
+		return []byte{}, nil
+	}
 	// Hex format.
 	if len(s) >= 2 && bytes.Equal(s[:2], []byte("\\x")) {
 		s = s[2:] // trim off leading "\\x"

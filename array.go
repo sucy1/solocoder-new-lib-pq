@@ -186,6 +186,9 @@ func (a *ByteaArray) scanBytes(src []byte) error {
 	} else {
 		b := make(ByteaArray, len(elems))
 		for i, v := range elems {
+			if v == nil {
+				continue
+			}
 			b[i], err = parseBytea(v)
 			if err != nil {
 				return fmt.Errorf("could not parse bytea array index %d: %w", i, err)

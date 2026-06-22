@@ -171,6 +171,22 @@ const (
 var sslProtocolVersions = []SSLProtocolVersion{SSLProtocolVersionTLS10, SSLProtocolVersionTLS11,
 	SSLProtocolVersionTLS12, SSLProtocolVersionTLS13}
 
+// Values for [ChannelBinding] that pq supports.
+const (
+	// Channel binding is disabled.
+	ChannelBindingDisable = "disable"
+
+	// Channel binding is used if the server supports it and the connection
+	// is TLS. This is the default.
+	ChannelBindingPrefer = "prefer"
+
+	// Channel binding is required; the connection will fail if the server
+	// does not support it or the connection is not TLS.
+	ChannelBindingRequire = "require"
+)
+
+var channelBindings = []string{ChannelBindingDisable, ChannelBindingPrefer, ChannelBindingRequire}
+
 func (s SSLProtocolVersion) tlsconf() uint16 {
 	switch s {
 	case SSLProtocolVersionTLS10:
@@ -228,10 +244,11 @@ type Connector struct {
 	cfg    Config
 	dialer Dialer
 
-	healthCheckMu     sync.Mutex
-	healthCheckConns  map[*conn]struct{}
-	healthCheckTicker *time.Ticker
-	healthCheckDone   chan struct{}
+	healthCheckInterval time.Duration
+	healthCheckMu       sync.Mutex
+	healthCheckConns    map[*conn]struct{}
+	healthCheckTicker   *time.Ticker
+	healthCheckDone     chan struct{}
 }
 
 // NewConnector returns a connector for the pq driver in a fixed configuration
@@ -257,7 +274,14 @@ func NewConnectorConfig(cfg Config) (*Connector, error) {
 		healthCheckConns:  make(map[*conn]struct{}),
 		healthCheckDone:   make(chan struct{}),
 	}
-	if cfg.HealthCheckInterval > 0 {
+
+	interval := cfg.HealthCheckInterval
+	if !cfg.isset("health_check_interval") {
+		interval = 30 * time.Second
+	}
+
+	if interval > 0 {
+		c.healthCheckInterval = interval
 		c.startHealthCheck()
 	}
 	return c, nil
@@ -281,7 +305,7 @@ func (c *Connector) startHealthCheck() {
 		return
 	}
 
-	c.healthCheckTicker = time.NewTicker(c.cfg.HealthCheckInterval)
+	c.healthCheckTicker = time.NewTicker(c.healthCheckInterval)
 	go c.healthCheckLoop()
 }
 
@@ -301,7 +325,7 @@ func (c *Connector) stopHealthCheck() {
 }
 
 func (c *Connector) registerConn(cn *conn) {
-	if c.cfg.HealthCheckInterval <= 0 {
+	if c.healthCheckInterval <= 0 {
 		return
 	}
 	c.healthCheckMu.Lock()
@@ -319,7 +343,7 @@ func (c *Connector) healthCheckLoop() {
 	for {
 		select {
 		case <-c.healthCheckTicker.C:
-			if c.cfg.HealthCheckInterval <= 0 {
+			if c.healthCheckInterval <= 0 {
 				return
 			}
 			c.checkAllConns()
@@ -330,7 +354,7 @@ func (c *Connector) healthCheckLoop() {
 }
 
 func (c *Connector) checkAllConns() {
-	if c.cfg.HealthCheckInterval <= 0 {
+	if c.healthCheckInterval <= 0 {
 		return
 	}
 	c.healthCheckMu.Lock()
@@ -594,6 +618,15 @@ type Config struct {
 	// Connection name for logging and debugging purposes. If not set, it will
 	// be automatically set to os.Args[0].
 	ConnectionName string `postgres:"connection_name" env:"PGCONNECT_NAME"`
+
+	// ChannelBinding controls the use of channel binding in SCRAM authentication.
+	// Supported values: "require", "prefer", "disable".
+	// If "require", channel binding is required and the connection will fail
+	// if the server does not support it.
+	// If "prefer" (default), channel binding is used if the server supports it
+	// and the connection is TLS.
+	// If "disable", channel binding is not used.
+	ChannelBinding string `postgres:"channel_binding" env:"PGCHANNELBINDING"`
 
 	// HealthCheckInterval specifies the interval between connection health
 	// checks. If set to 0, health checks are disabled. During each check,
@@ -999,6 +1032,7 @@ func (cfg *Config) setFromTag(o map[string]string, tag string, service bool) err
 			sslminprotocolversion = (tag == "postgres" && k == "ssl_min_protocol_version") || (tag == "env" && k == "PGSSLMINPROTOCOLVERSION")
 			sslmaxprotocolversion = (tag == "postgres" && k == "ssl_max_protocol_version") || (tag == "env" && k == "PGSSLMAXPROTOCOLVERSION")
 			requireauth           = (tag == "postgres" && k == "require_auth") || (tag == "env" && k == "PGREQUIREAUTH")
+			channelbinding        = (tag == "postgres" && k == "channel_binding") || (tag == "env" && k == "PGCHANNELBINDING")
 		)
 		if k == "" || k == "-" {
 			continue
@@ -1060,6 +1094,9 @@ func (cfg *Config) setFromTag(o map[string]string, tag string, service bool) err
 				}
 				if (sslminprotocolversion || sslmaxprotocolversion) && !slices.Contains(sslProtocolVersions, SSLProtocolVersion(v)) {
 					return fmt.Errorf(f+`%q is not supported; supported values are %s`, k, v, pqutil.Join(sslProtocolVersions))
+				}
+				if channelbinding && !slices.Contains(channelBindings, v) {
+					return fmt.Errorf(f+`%q is not supported; supported values are %s`, k, v, pqutil.Join(channelBindings))
 				}
 				if host {
 					vv := strings.Split(v, ",")

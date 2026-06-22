@@ -1562,22 +1562,50 @@ func (cn *conn) auth(code proto.AuthCode, r *readBuf, cfg Config) error {
 		}
 
 		_, isTLS := cn.c.(*tls.Conn)
+		cb := cn.cfg.ChannelBinding
+		if cb == "" {
+			cb = ChannelBindingPrefer
+		}
+
 		var selectedMech string
-		if hasPlus && isTLS {
+		var useCB bool
+
+		switch cb {
+		case ChannelBindingRequire:
+			if !isTLS {
+				return errors.New("pq: channel_binding=require but connection is not TLS")
+			}
+			if !hasPlus {
+				return errors.New("pq: channel_binding=require but server does not support SCRAM-SHA-256-PLUS")
+			}
 			selectedMech = "SCRAM-SHA-256-PLUS"
-		} else if hasPlus && !isTLS {
-			if hasPlain {
+			useCB = true
+		case ChannelBindingPrefer:
+			if cn.cfg.isset("channel_binding") && hasPlus && isTLS {
+				selectedMech = "SCRAM-SHA-256-PLUS"
+				useCB = true
+			} else if hasPlain {
 				selectedMech = "SCRAM-SHA-256"
+				useCB = false
+			} else if hasPlus && isTLS {
+				selectedMech = "SCRAM-SHA-256-PLUS"
+				useCB = true
 			} else {
 				return errors.New("pq: server only offers SCRAM-SHA-256-PLUS but connection is not TLS")
 			}
-		} else {
+		case ChannelBindingDisable:
+			if !hasPlain {
+				return errors.New("pq: channel_binding=disable but server only offers SCRAM-SHA-256-PLUS")
+			}
 			selectedMech = "SCRAM-SHA-256"
+			useCB = false
+		default:
+			return fmt.Errorf("pq: invalid channel_binding value: %q", cb)
 		}
 
 		cn.authMethod = selectedMech
 		sc := scram.NewClient(sha256.New, cfg.User, cfg.Password)
-		if selectedMech == "SCRAM-SHA-256-PLUS" {
+		if useCB {
 			sc.SetChannelBinding(true)
 		}
 		sc.Step(nil)
