@@ -805,6 +805,17 @@ func appendArrayElement(b []byte, rv reflect.Value) ([]byte, string, error) {
 
 	var del = ","
 	var err error
+
+	// Check for nil values via reflection to catch typed nils
+	// (e.g. []byte(nil), *string(nil)) that would not be caught
+	// by the type switch below.
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		if rv.IsNil() {
+			return append(b, "NULL"...), del, nil
+		}
+	}
+
 	var iv = rv.Interface()
 
 	if ad, ok := iv.(ArrayDelimiter); ok {
@@ -819,6 +830,9 @@ func appendArrayElement(b []byte, rv reflect.Value) ([]byte, string, error) {
 	case nil:
 		return append(b, "NULL"...), del, nil
 	case []byte:
+		if v == nil {
+			return append(b, "NULL"...), del, nil
+		}
 		return appendArrayQuotedBytes(b, v), del, nil
 	case string:
 		return appendArrayQuotedBytes(b, []byte(v)), del, nil

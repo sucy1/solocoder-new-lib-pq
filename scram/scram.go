@@ -61,10 +61,11 @@ type Client struct {
 	out  bytes.Buffer
 	err  error
 
-	clientNonce []byte
-	serverNonce []byte
-	saltedPass  []byte
-	authMsg     bytes.Buffer
+	clientNonce    []byte
+	serverNonce    []byte
+	saltedPass     []byte
+	authMsg        bytes.Buffer
+	channelBinding bool
 }
 
 // NewClient returns a new SCRAM-* client with the provided hash algorithm.
@@ -81,6 +82,14 @@ func NewClient(newHash func() hash.Hash, user, pass string) *Client {
 	c.out.Grow(256)
 	c.authMsg.Grow(256)
 	return c
+}
+
+// SetChannelBinding enables or disables channel binding support.
+// When enabled, the client uses "y" GS2 flag to indicate support for
+// channel binding, which helps prevent downgrade attacks from
+// SCRAM-SHA-256-PLUS to SCRAM-SHA-256.
+func (c *Client) SetChannelBinding(enabled bool) {
+	c.channelBinding = enabled
 }
 
 // Out returns the data to be sent to the server in the current step.
@@ -140,7 +149,13 @@ func (c *Client) step1(in []byte) error {
 	c.authMsg.WriteString(",r=")
 	c.authMsg.Write(c.clientNonce)
 
-	c.out.WriteString("n,,")
+	var gs2Header string
+	if c.channelBinding {
+		gs2Header = "y,,"
+	} else {
+		gs2Header = "n,,"
+	}
+	c.out.WriteString(gs2Header)
 	c.out.Write(c.authMsg.Bytes())
 	return nil
 }
@@ -182,10 +197,22 @@ func (c *Client) step2(in []byte) error {
 	}
 	c.saltPassword(salt, iterCount)
 
-	c.authMsg.WriteString(",c=biws,r=")
+	var gs2Header string
+	if c.channelBinding {
+		gs2Header = "y,,"
+	} else {
+		gs2Header = "n,,"
+	}
+	cbData := b64.EncodeToString([]byte(gs2Header))
+
+	c.authMsg.WriteString(",c=")
+	c.authMsg.WriteString(cbData)
+	c.authMsg.WriteString(",r=")
 	c.authMsg.Write(c.serverNonce)
 
-	c.out.WriteString("c=biws,r=")
+	c.out.WriteString("c=")
+	c.out.WriteString(cbData)
+	c.out.WriteString(",r=")
 	c.out.Write(c.serverNonce)
 	c.out.WriteString(",p=")
 	c.out.Write(c.clientProof())

@@ -319,6 +319,9 @@ func (c *Connector) healthCheckLoop() {
 	for {
 		select {
 		case <-c.healthCheckTicker.C:
+			if c.cfg.HealthCheckInterval <= 0 {
+				return
+			}
 			c.checkAllConns()
 		case <-c.healthCheckDone:
 			return
@@ -327,6 +330,9 @@ func (c *Connector) healthCheckLoop() {
 }
 
 func (c *Connector) checkAllConns() {
+	if c.cfg.HealthCheckInterval <= 0 {
+		return
+	}
 	c.healthCheckMu.Lock()
 	conns := make([]*conn, 0, len(c.healthCheckConns))
 	for cn := range c.healthCheckConns {

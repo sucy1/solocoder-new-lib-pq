@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/sha256"
+	"crypto/tls"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/binary"
@@ -1542,8 +1543,43 @@ func (cn *conn) auth(code proto.AuthCode, r *readBuf, cfg Config) error {
 		if len(cn.cfg.RequireAuth) > 0 && !slices.Contains(cn.cfg.RequireAuth, RequireAuthScramSHA256) && !slices.Contains(cn.cfg.RequireAuth, RequireAuthAny) {
 			return fmt.Errorf("pq: authentication method requirement %q failed: server requested %q", cn.cfg.RequireAuth, RequireAuthScramSHA256)
 		}
-		cn.authMethod = "scram-sha-256"
+		mechanisms := []string{}
+		for len(*r) > 0 {
+			mech := r.string()
+			if mech == "" {
+				break
+			}
+			mechanisms = append(mechanisms, mech)
+		}
+		if len(mechanisms) == 0 {
+			return errors.New("pq: server sent empty SASL mechanism list")
+		}
+
+		hasPlus := slices.Contains(mechanisms, "SCRAM-SHA-256-PLUS")
+		hasPlain := slices.Contains(mechanisms, "SCRAM-SHA-256")
+		if !hasPlus && !hasPlain {
+			return fmt.Errorf("pq: server does not support SCRAM-SHA-256, offered mechanisms: %v", mechanisms)
+		}
+
+		_, isTLS := cn.c.(*tls.Conn)
+		var selectedMech string
+		if hasPlus && isTLS {
+			selectedMech = "SCRAM-SHA-256-PLUS"
+		} else if hasPlus && !isTLS {
+			if hasPlain {
+				selectedMech = "SCRAM-SHA-256"
+			} else {
+				return errors.New("pq: server only offers SCRAM-SHA-256-PLUS but connection is not TLS")
+			}
+		} else {
+			selectedMech = "SCRAM-SHA-256"
+		}
+
+		cn.authMethod = selectedMech
 		sc := scram.NewClient(sha256.New, cfg.User, cfg.Password)
+		if selectedMech == "SCRAM-SHA-256-PLUS" {
+			sc.SetChannelBinding(true)
+		}
 		sc.Step(nil)
 		if sc.Err() != nil {
 			return fmt.Errorf("pq: SCRAM-SHA-256 error: %w", sc.Err())
@@ -1551,7 +1587,7 @@ func (cn *conn) auth(code proto.AuthCode, r *readBuf, cfg Config) error {
 		scOut := sc.Out()
 
 		w := cn.writeBuf(proto.SASLResponse)
-		w.string("SCRAM-SHA-256")
+		w.string(selectedMech)
 		w.int32(len(scOut))
 		w.bytes(scOut)
 		err := cn.send(w)
