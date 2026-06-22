@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -226,6 +227,11 @@ func (r RequireAuths) String() string {
 type Connector struct {
 	cfg    Config
 	dialer Dialer
+
+	healthCheckMu     sync.Mutex
+	healthCheckConns  map[*conn]struct{}
+	healthCheckTicker *time.Ticker
+	healthCheckDone   chan struct{}
 }
 
 // NewConnector returns a connector for the pq driver in a fixed configuration
@@ -245,7 +251,16 @@ func NewConnector(dsn string) (*Connector, error) {
 // create any number of equivalent Conn's. The returned connector is intended to
 // be used with [sql.OpenDB].
 func NewConnectorConfig(cfg Config) (*Connector, error) {
-	return &Connector{cfg: cfg, dialer: defaultDialer{}}, nil
+	c := &Connector{
+		cfg:               cfg,
+		dialer:            defaultDialer{},
+		healthCheckConns:  make(map[*conn]struct{}),
+		healthCheckDone:   make(chan struct{}),
+	}
+	if cfg.HealthCheckInterval > 0 {
+		c.startHealthCheck()
+	}
+	return c, nil
 }
 
 // Connect returns a connection to the database using the fixed configuration of
@@ -257,6 +272,76 @@ func (c *Connector) Dialer(dialer Dialer) { c.dialer = dialer }
 
 // Driver returns the underlying driver of this Connector.
 func (c *Connector) Driver() driver.Driver { return &Driver{} }
+
+func (c *Connector) startHealthCheck() {
+	c.healthCheckMu.Lock()
+	defer c.healthCheckMu.Unlock()
+
+	if c.healthCheckTicker != nil {
+		return
+	}
+
+	c.healthCheckTicker = time.NewTicker(c.cfg.HealthCheckInterval)
+	go c.healthCheckLoop()
+}
+
+func (c *Connector) stopHealthCheck() {
+	c.healthCheckMu.Lock()
+	defer c.healthCheckMu.Unlock()
+
+	if c.healthCheckTicker != nil {
+		c.healthCheckTicker.Stop()
+		c.healthCheckTicker = nil
+	}
+	select {
+	case <-c.healthCheckDone:
+	default:
+		close(c.healthCheckDone)
+	}
+}
+
+func (c *Connector) registerConn(cn *conn) {
+	if c.cfg.HealthCheckInterval <= 0 {
+		return
+	}
+	c.healthCheckMu.Lock()
+	defer c.healthCheckMu.Unlock()
+	c.healthCheckConns[cn] = struct{}{}
+}
+
+func (c *Connector) unregisterConn(cn *conn) {
+	c.healthCheckMu.Lock()
+	defer c.healthCheckMu.Unlock()
+	delete(c.healthCheckConns, cn)
+}
+
+func (c *Connector) healthCheckLoop() {
+	for {
+		select {
+		case <-c.healthCheckTicker.C:
+			c.checkAllConns()
+		case <-c.healthCheckDone:
+			return
+		}
+	}
+}
+
+func (c *Connector) checkAllConns() {
+	c.healthCheckMu.Lock()
+	conns := make([]*conn, 0, len(c.healthCheckConns))
+	for cn := range c.healthCheckConns {
+		conns = append(conns, cn)
+	}
+	c.healthCheckMu.Unlock()
+
+	for _, cn := range conns {
+		if err := cn.checkHealth(); err != nil {
+			c.unregisterConn(cn)
+			cn.err.set(driver.ErrBadConn)
+			_ = cn.c.Close()
+		}
+	}
+}
 
 func (p ProtocolVersion) proto() int {
 	switch p {
@@ -499,6 +584,16 @@ type Config struct {
 	// available in [Config.Host], [Config.Hostaddr], and [Config.Port], and
 	// additional ones (if any) are available here.
 	Multi []ConfigMultihost
+
+	// Connection name for logging and debugging purposes. If not set, it will
+	// be automatically set to os.Args[0].
+	ConnectionName string `postgres:"connection_name" env:"PGCONNECT_NAME"`
+
+	// HealthCheckInterval specifies the interval between connection health
+	// checks. If set to 0, health checks are disabled. During each check,
+	// a "SELECT 1" query is executed. Failed connections are automatically
+	// closed and removed from the pool.
+	HealthCheckInterval time.Duration `postgres:"health_check_interval" env:"PGHEALTH_CHECK_INTERVAL"`
 
 	// Record which parameters were given, so we can distinguish between an
 	// empty string "not given at all".
@@ -885,6 +980,7 @@ func (cfg *Config) setFromTag(o map[string]string, tag string, service bool) err
 			rv                    = values.Field(i)
 			k                     = rt.Tag.Get(tag)
 			connectTimeout        = (tag == "postgres" && k == "connect_timeout") || (tag == "env" && k == "PGCONNECT_TIMEOUT")
+			healthCheckInterval   = (tag == "postgres" && k == "health_check_interval") || (tag == "env" && k == "PGHEALTH_CHECK_INTERVAL")
 			host                  = (tag == "postgres" && k == "host") || (tag == "env" && k == "PGHOST")
 			hostaddr              = (tag == "postgres" && k == "hostaddr") || (tag == "env" && k == "PGHOSTADDR")
 			port                  = (tag == "postgres" && k == "port") || (tag == "env" && k == "PGPORT")
@@ -1000,7 +1096,7 @@ func (cfg *Config) setFromTag(o map[string]string, tag string, service bool) err
 				if err != nil {
 					return fmt.Errorf(f+"%w", k, err)
 				}
-				if connectTimeout {
+				if connectTimeout || healthCheckInterval {
 					n = int64(time.Duration(n) * time.Second)
 				}
 				rv.SetInt(n)
@@ -1089,7 +1185,7 @@ func (cfg Config) tomap() map[string]string {
 				o[k] = strconv.FormatUint(n, 10)
 			case reflect.Int64:
 				n := rv.Int()
-				if k == "connect_timeout" {
+				if k == "connect_timeout" || k == "health_check_interval" {
 					n = int64(time.Duration(n) / time.Second)
 				}
 				o[k] = strconv.FormatInt(n, 10)

@@ -99,13 +99,35 @@ type NullTime = sql.NullTime
 //
 // It copies all columns if the list of columns is empty.
 //
+// The onConflict parameter specifies the ON CONFLICT clause. Valid values are:
+//   - "": no ON CONFLICT clause (default)
+//   - "DO NOTHING": adds ON CONFLICT DO NOTHING
+//   - "DO UPDATE SET": adds ON CONFLICT DO UPDATE SET (requires unique constraint)
+//
 // Deprecated: there is no need to use this query builder, you can use:
 //
 //	tx.Prepare("copy tbl (col1, col2) from stdin")
 func CopyIn(table string, columns ...string) string {
+	return CopyInConflict("", table, columns...)
+}
+
+// CopyInConflict creates a COPY FROM statement with ON CONFLICT clause support.
+// The target table should be visible in search_path.
+//
+// It copies all columns if the list of columns is empty.
+//
+// The onConflict parameter specifies the ON CONFLICT clause. Valid values are:
+//   - "": no ON CONFLICT clause (default)
+//   - "DO NOTHING": adds ON CONFLICT DO NOTHING
+//   - "DO UPDATE SET": adds ON CONFLICT DO UPDATE SET (requires unique constraint)
+//
+// Deprecated: there is no need to use this query builder, you can use:
+//
+//	tx.Prepare("copy tbl (col1, col2) from stdin on conflict do nothing")
+func CopyInConflict(onConflict, table string, columns ...string) string {
 	b := bytes.NewBufferString("COPY ")
 	BufferQuoteIdentifier(table, b)
-	makeStmt(b, columns...)
+	makeStmt(b, onConflict, columns...)
 	return b.String()
 }
 
@@ -116,25 +138,38 @@ func CopyIn(table string, columns ...string) string {
 //
 //	tx.Prepare("copy schema.tbl (col1, col2) from stdin")
 func CopyInSchema(schema, table string, columns ...string) string {
+	return CopyInSchemaConflict("", schema, table, columns...)
+}
+
+// CopyInSchemaConflict creates a COPY FROM statement with ON CONFLICT clause support.
+//
+// Deprecated: there is no need to use this query builder, you can use:
+//
+//	tx.Prepare("copy schema.tbl (col1, col2) from stdin on conflict do nothing")
+func CopyInSchemaConflict(onConflict, schema, table string, columns ...string) string {
 	b := bytes.NewBufferString("COPY ")
 	BufferQuoteIdentifier(schema, b)
 	b.WriteRune('.')
 	BufferQuoteIdentifier(table, b)
-	makeStmt(b, columns...)
+	makeStmt(b, onConflict, columns...)
 	return b.String()
 }
 
-func makeStmt(b *bytes.Buffer, columns ...string) {
+func makeStmt(b *bytes.Buffer, onConflict string, columns ...string) {
 	if len(columns) == 0 {
 		b.WriteString(" FROM STDIN")
-		return
-	}
-	b.WriteString(" (")
-	for i, col := range columns {
-		if i != 0 {
-			b.WriteString(", ")
+	} else {
+		b.WriteString(" (")
+		for i, col := range columns {
+			if i != 0 {
+				b.WriteString(", ")
+			}
+			BufferQuoteIdentifier(col, b)
 		}
-		BufferQuoteIdentifier(col, b)
+		b.WriteString(") FROM STDIN")
 	}
-	b.WriteString(") FROM STDIN")
+	if onConflict != "" {
+		b.WriteString(" ON CONFLICT ")
+		b.WriteString(onConflict)
+	}
 }

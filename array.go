@@ -25,8 +25,12 @@ var typeSQLScanner = reflect.TypeFor[sql.Scanner]()
 //	var x []sql.NullInt64
 //	db.QueryRow(`SELECT ARRAY[235, 401]`).Scan(pq.Array(&x))
 //
-// Scanning multi-dimensional arrays is not supported.  Arrays where the lower
-// bound is not one (such as `[0:0]={1}') are not supported.
+// Multi-dimensional arrays are supported. For example:
+//
+//	var x [][]int
+//	db.QueryRow(`SELECT ARRAY[[1,2],[3,4]]`).Scan(pq.Array(&x))
+//
+// Arrays where the lower bound is not one (such as `[0:0]={1}') are not supported.
 func Array(a any) interface {
 	driver.Valuer
 	sql.Scanner
@@ -71,6 +75,13 @@ func Array(a any) interface {
 type ArrayDelimiter interface {
 	// ArrayDelimiter returns the delimiter character(s) for this element's type.
 	ArrayDelimiter() string
+}
+
+// ArrayDimensioner may be implemented by driver.Valuer or sql.Scanner
+// to provide dimension information for multi-dimensional arrays.
+type ArrayDimensioner interface {
+	// ArrayDimensions returns the dimensions of the array.
+	ArrayDimensions() []int
 }
 
 // BoolArray represents a one-dimensional array of the PostgreSQL boolean type.
@@ -345,6 +356,37 @@ func (a Float32Array) Value() (driver.Value, error) {
 	return "{}", nil
 }
 
+// ArrayDimensions returns the dimensions of a multi-dimensional array.
+// For example, for a 2x3 array, it returns []int{2, 3}.
+// Returns nil if the input is not an array or slice.
+func ArrayDimensions(a any) []int {
+	if a == nil {
+		return nil
+	}
+	rv := reflect.ValueOf(a)
+	return arrayDimensions(rv)
+}
+
+func arrayDimensions(rv reflect.Value) []int {
+	switch rv.Kind() {
+	case reflect.Slice:
+		if rv.IsNil() {
+			return nil
+		}
+		fallthrough
+	case reflect.Array:
+		dims := []int{rv.Len()}
+		if rv.Len() > 0 {
+			subDims := arrayDimensions(rv.Index(0))
+			if subDims != nil {
+				dims = append(dims, subDims...)
+			}
+		}
+		return dims
+	}
+	return nil
+}
+
 // GenericArray implements the driver.Valuer and sql.Scanner interfaces for
 // an array or slice of any dimension.
 type GenericArray struct{ A any }
@@ -353,11 +395,12 @@ func (GenericArray) evaluateDestination(rt reflect.Type) (reflect.Type, func([]b
 	var assign func([]byte, reflect.Value) error
 	var del = ","
 
-	// TODO calculate the assign function for other types
-	// TODO repeat this section on the element type of arrays or slices (multidimensional)
+	for rt.Kind() == reflect.Slice || rt.Kind() == reflect.Array {
+		rt = rt.Elem()
+	}
+
 	{
 		if reflect.PointerTo(rt).Implements(typeSQLScanner) {
-			// dest is always addressable because it is an element of a slice.
 			assign = func(src []byte, dest reflect.Value) (err error) {
 				ss := dest.Addr().Interface().(sql.Scanner)
 				if src == nil {
@@ -418,35 +461,35 @@ func (a GenericArray) Scan(src any) error {
 }
 
 func (a GenericArray) scanBytes(src []byte, dv reflect.Value) error {
+	dstDims := arrayDimensions(dv)
+	if dstDims == nil {
+		dstDims = []int{0}
+	}
+
 	dtype, assign, del := a.evaluateDestination(dv.Type().Elem())
 	dims, elems, err := parseArray(src, []byte(del))
 	if err != nil {
 		return err
 	}
 
-	// TODO allow multidimensional
-
-	if len(dims) > 1 {
-		return fmt.Errorf("pq: scanning from multidimensional ARRAY%s is not implemented",
-			strings.Replace(fmt.Sprint(dims), " ", "][", -1))
-	}
-
-	// Treat a zero-dimensional array like an array with a single dimension of zero.
 	if len(dims) == 0 {
 		dims = append(dims, 0)
 	}
 
-	for i, rt := 0, dv.Type(); i < len(dims); i, rt = i+1, rt.Elem() {
-		switch rt.Kind() {
-		case reflect.Slice:
-		case reflect.Array:
-			if rt.Len() != dims[i] {
-				return fmt.Errorf("pq: cannot convert ARRAY%s to %s",
-					strings.Replace(fmt.Sprint(dims), " ", "][", -1), dv.Type())
-			}
-		default:
-			// TODO handle multidimensional
+	if len(dims) != len(dstDims) {
+		return fmt.Errorf("pq: cannot convert ARRAY%s to %s: multidimensional ARRAY%s is not implemented",
+			strings.Replace(fmt.Sprint(dims), " ", "][", -1), dv.Type(),
+			strings.Replace(fmt.Sprint(dims), " ", "][", -1))
+	}
+
+	// Check dimension sizes only for fixed-size arrays, not for slices
+	targetType := dv.Type()
+	for i := range dims {
+		if targetType.Kind() == reflect.Array && targetType.Len() != dims[i] {
+			return fmt.Errorf("pq: cannot convert ARRAY%s to %s",
+				strings.Replace(fmt.Sprint(dims), " ", "][", -1), dv.Type())
 		}
+		targetType = targetType.Elem()
 	}
 
 	values := reflect.MakeSlice(reflect.SliceOf(dtype), len(elems), len(elems))
@@ -457,18 +500,48 @@ func (a GenericArray) scanBytes(src []byte, dv reflect.Value) error {
 		}
 	}
 
-	// TODO handle multidimensional
+	result, err := reshapeArray(values, dims, dv.Type())
+	if err != nil {
+		return err
+	}
 
 	switch dv.Kind() {
 	case reflect.Slice:
-		dv.Set(values.Slice(0, dims[0]))
+		dv.Set(result)
 	case reflect.Array:
-		for i := 0; i < dims[0]; i++ {
-			dv.Index(i).Set(values.Index(i))
+		for i := 0; i < dv.Len(); i++ {
+			dv.Index(i).Set(result.Index(i))
 		}
 	}
 
 	return nil
+}
+
+func reshapeArray(flat reflect.Value, dims []int, targetType reflect.Type) (reflect.Value, error) {
+	if len(dims) == 1 {
+		return flat.Slice(0, dims[0]), nil
+	}
+
+	elemType := targetType.Elem()
+	result := reflect.MakeSlice(targetType, dims[0], dims[0])
+
+	elemSize := 1
+	for _, d := range dims[1:] {
+		elemSize *= d
+	}
+
+	for i := 0; i < dims[0]; i++ {
+		start := i * elemSize
+		end := start + elemSize
+		subFlat := flat.Slice(start, end)
+		subResult, err := reshapeArray(subFlat, dims[1:], elemType)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		result.Index(i).Set(subResult)
+	}
+
+	return result, nil
 }
 
 // Value implements the driver.Valuer interface.

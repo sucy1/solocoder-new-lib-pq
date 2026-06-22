@@ -193,6 +193,8 @@ type conn struct {
 	noticeHandler       func(*Error)        // If not nil, notices will be synchronously sent here
 	notificationHandler func(*Notification) // If not nil, notifications will be synchronously sent here
 	gss                 GSS                 // GSSAPI context
+	authMethod          string              // Authentication method used for this connection
+	connector           *Connector          // Reference to the connector that created this connection
 }
 
 type syncErr struct {
@@ -280,7 +282,7 @@ restartAll:
 		}
 
 		cfg.SSLMode = mode
-		cn := &conn{cfg: cfg, dialer: c.dialer}
+		cn := &conn{cfg: cfg, dialer: c.dialer, connector: c}
 		cn.cfg.Password = pgpass.PasswordFromPgpass(cn.cfg.Passfile, cn.cfg.User, cn.cfg.Password,
 			cn.cfg.Host, strconv.Itoa(int(cn.cfg.Port)), cn.cfg.Database)
 
@@ -328,6 +330,7 @@ restartAll:
 			continue
 		}
 
+		c.registerConn(cn)
 		return cn, nil
 	}
 
@@ -849,6 +852,10 @@ func (cn *conn) PrepareContext(ctx context.Context, q string) (driver.Stmt, erro
 }
 
 func (cn *conn) Close() error {
+	if cn.connector != nil {
+		cn.connector.unregisterConn(cn)
+	}
+
 	// Don't go through send(); ListenerConn relies on us not scribbling on the
 	// scratch buffer of this connection.
 	err := cn.sendSimpleMessage(proto.Terminate)
@@ -857,6 +864,33 @@ func (cn *conn) Close() error {
 		return cn.handleError(err)
 	}
 	return cn.c.Close()
+}
+
+func (cn *conn) checkHealth() error {
+	if err := cn.err.get(); err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		rows, err := cn.simpleQuery("SELECT 1")
+		if err != nil {
+			done <- err
+			return
+		}
+		_ = rows.Close()
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // CheckNamedValue implements [driver.NamedValueChecker].
@@ -1328,9 +1362,6 @@ func (cn *conn) ssl(cfg Config, mode SSLMode) error {
 
 func (cn *conn) startup(cfg Config) error {
 	w := cn.writeBuf(0)
-	// Send maximum protocol version in startup; if the server doesn't support
-	// this version it responds with NegotiateProtocolVersion and the maximum
-	// version it supports (and will use).
 	w.int32(cfg.MaxProtocolVersion.proto())
 
 	if cfg.User != "" {
@@ -1341,7 +1372,6 @@ func (cn *conn) startup(cfg Config) error {
 		w.string("database")
 		w.string(cfg.Database)
 	}
-	// w.string("replication") // Sent by libpq, but we don't support that.
 	if cfg.Options != "" {
 		w.string("options")
 		w.string(cfg.Options)
@@ -1349,6 +1379,14 @@ func (cn *conn) startup(cfg Config) error {
 	if cfg.ApplicationName != "" {
 		w.string("application_name")
 		w.string(cfg.ApplicationName)
+	}
+	connName := cfg.ConnectionName
+	if connName == "" && len(os.Args) > 0 {
+		connName = os.Args[0]
+	}
+	if connName != "" {
+		w.string("connection_name")
+		w.string(connName)
 	}
 	if cfg.ClientEncoding != "" {
 		w.string("client_encoding")
@@ -1358,6 +1396,8 @@ func (cn *conn) startup(cfg Config) error {
 		w.string("datestyle")
 		w.string(cfg.Datestyle)
 	}
+	w.string("prefer_scram_sha_256")
+	w.string("1")
 	for k, v := range cfg.Runtime {
 		w.string(k)
 		w.string(v)
@@ -1404,6 +1444,13 @@ func (cn *conn) startup(cfg Config) error {
 				return fmt.Errorf("pq: authentication method requirement %q failed: server did not perform any authentication", cn.cfg.RequireAuth)
 			}
 			cn.processReadyForQuery(r)
+			if debugProto {
+				authMethod := cn.authMethod
+				if authMethod == "" {
+					authMethod = "none"
+				}
+				fmt.Fprintf(os.Stderr, "CONNECT  auth method: %s\n", authMethod)
+			}
 			return nil
 		default:
 			return fmt.Errorf("pq: unknown response for startup: %q", t)
@@ -1418,32 +1465,33 @@ func (cn *conn) auth(code proto.AuthCode, r *readBuf, cfg Config) error {
 	case proto.AuthReqKrb4, proto.AuthReqKrb5, proto.AuthReqCrypt, proto.AuthReqSSPI:
 		return fmt.Errorf("pq: unsupported authentication method: %s", code)
 	case proto.AuthReqOk:
+		cn.authMethod = "ok"
 		return nil
 
 	case proto.AuthReqPassword:
 		if len(cn.cfg.RequireAuth) > 0 && !slices.Contains(cn.cfg.RequireAuth, RequireAuthPassword) && !slices.Contains(cn.cfg.RequireAuth, RequireAuthAny) {
 			return fmt.Errorf("pq: authentication method requirement %q failed: server requested %q", cn.cfg.RequireAuth, RequireAuthPassword)
 		}
+		cn.authMethod = "password"
 		w := cn.writeBuf(proto.PasswordMessage)
 		w.string(cfg.Password)
-		// Don't need to check AuthOk response here; auth() is called in a loop,
-		// which catches the errors and AuthReqOk responses.
 		return cn.send(w)
 
 	case proto.AuthReqMD5:
 		if len(cn.cfg.RequireAuth) > 0 && !slices.Contains(cn.cfg.RequireAuth, RequireAuthMD5) && !slices.Contains(cn.cfg.RequireAuth, RequireAuthAny) {
 			return fmt.Errorf("pq: authentication method requirement %q failed: server requested %q", cn.cfg.RequireAuth, RequireAuthMD5)
 		}
+		cn.authMethod = "md5"
 		s := string(r.next(4))
 		w := cn.writeBuf(proto.PasswordMessage)
 		w.string("md5" + md5s(md5s(cfg.Password+cfg.User)+s))
-		// Same here.
 		return cn.send(w)
 
 	case proto.AuthReqGSS: // GSSAPI, startup
 		if newGss == nil {
 			return fmt.Errorf("pq: kerberos error: no GSSAPI provider registered (import github.com/lib/pq/auth/kerberos)")
 		}
+		cn.authMethod = "gss"
 		cli, err := newGss()
 		if err != nil {
 			return fmt.Errorf("pq: kerberos error: %w", err)
@@ -1451,10 +1499,8 @@ func (cn *conn) auth(code proto.AuthCode, r *readBuf, cfg Config) error {
 
 		var token []byte
 		if cfg.KrbSpn != "" {
-			// Use the supplied SPN if provided.
 			token, err = cli.GetInitTokenFromSpn(cfg.KrbSpn)
 		} else {
-			// Allow the kerberos service name to be overridden.
 			service := "postgres"
 			if cfg.KrbSrvname != "" {
 				service = cfg.KrbSrvname
@@ -1472,7 +1518,6 @@ func (cn *conn) auth(code proto.AuthCode, r *readBuf, cfg Config) error {
 			return err
 		}
 
-		// Store for GSSAPI continue message
 		cn.gss = cli
 		return nil
 
@@ -1491,14 +1536,13 @@ func (cn *conn) auth(code proto.AuthCode, r *readBuf, cfg Config) error {
 			}
 		}
 
-		// Errors fall through and read the more detailed message from the
-		// server.
 		return nil
 
 	case proto.AuthReqSASL:
 		if len(cn.cfg.RequireAuth) > 0 && !slices.Contains(cn.cfg.RequireAuth, RequireAuthScramSHA256) && !slices.Contains(cn.cfg.RequireAuth, RequireAuthAny) {
 			return fmt.Errorf("pq: authentication method requirement %q failed: server requested %q", cn.cfg.RequireAuth, RequireAuthScramSHA256)
 		}
+		cn.authMethod = "scram-sha-256"
 		sc := scram.NewClient(sha256.New, cfg.User, cfg.Password)
 		sc.Step(nil)
 		if sc.Err() != nil {
